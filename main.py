@@ -7,7 +7,7 @@ import colorama
 import discord
 from discord.ext import commands, tasks
 
-from config import BASE_XP, TIME_FORMAT, DB_NAME, FILE_TYPES, CHANNELS_TO_LISTEN, ADMIN_ROLES
+from config import BASE_XP, TIME_FORMAT, DB_NAME, FILE_TYPES, CHANNELS_TO_LISTEN, ADMIN_ROLES, CHANNEL_TO_POST
 from discord_token import DISCORD_TOKEN
 
 colorama.init()
@@ -15,7 +15,7 @@ colorama.init()
 log = logging.getLogger("discord.my_log")
 handler = logging.FileHandler(f'{"discord"}.log')
 handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(message)s'))
-log .setLevel(20)
+log .setLevel(10)
 log .addHandler(handler)
 
 intents = discord.Intents.default()
@@ -29,12 +29,23 @@ def message_contains_image(msg: discord.Message) -> bool:
     return any(any(f_type in a.content_type for f_type in FILE_TYPES) for a in msg.attachments)
 
 
+def user_has_admin_role(user_roles, admin_roles):
+    # Check if a specific role is present
+    for role in user_roles:
+        if role.name in admin_roles:
+            return True
+    return False
+
+
 async def handle_new_user(msg: discord.Message, cursor):
     _channel = msg.channel
     _author = msg.author
     _guild = msg.guild
 
-    await _channel.send(f"We spy a new practitioner of the mystic arts!")
+    channel = next((ch for ch in bot.get_all_channels() if ch.name in CHANNEL_TO_POST), None)
+    if channel:
+        await channel.send(f"We spy a new practitioner of the mystic arts!")
+
     await cursor.execute(f"INSERT INTO {DB_NAME} ("
                          "user,"
                          "streak,"
@@ -46,6 +57,7 @@ async def handle_new_user(msg: discord.Message, cursor):
                          "guild)"
                          "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                          (_author.id, 1, 1, datetime.datetime.now().strftime(TIME_FORMAT), 0, 1, BASE_XP, _guild.id))
+    await bot.db.commit()
 
 
 async def handle_existing_user(msg: discord.Message, cursor, curr_xp):
@@ -59,7 +71,11 @@ async def handle_existing_user(msg: discord.Message, cursor, curr_xp):
 
     await cursor.execute(f"UPDATE {DB_NAME} SET xp = ?, last_submission = ? WHERE user = ? AND guild = ?",
                          (new_xp, datetime.datetime.now().strftime(TIME_FORMAT), _author.id, _guild.id))
-    await _channel.send(f"Added {BASE_XP} to {_author} in server {_guild}. (Current exp: {new_xp})")
+
+    channel = next((ch for ch in bot.get_all_channels() if ch.name in CHANNEL_TO_POST), None)
+    if channel:
+        await _channel.send(f"Added {BASE_XP} to {_author} in server {_guild}. (Current exp: {new_xp})")
+    await bot.db.commit()
 
 
 async def has_posted_today(ctx, cursor):
@@ -71,6 +87,7 @@ async def has_posted_today(ctx, cursor):
         await cursor.execute(f"SELECT last_submission from {DB_NAME} where user = ? AND guild = ?",
                              (_author.id, _guild.id))
         last_submission = await cursor.fetchone()
+    await bot.db.commit()
 
     if last_submission:
         return datetime.datetime.now().day == datetime.datetime.strptime(last_submission[0], TIME_FORMAT).day
@@ -100,7 +117,7 @@ async def on_ready() -> None:
     log.info(f"Adding cog-task to bot... (Run time: {DAILY_RESET_TIME})")
     await bot.add_cog(MyCog(bot))
 
-    channel = next((ch for ch in bot.get_all_channels() if ch.name in CHANNELS_TO_LISTEN), None)
+    channel = next((ch for ch in bot.get_all_channels() if ch.name in CHANNEL_TO_POST), None)
     if channel:
         await channel.send("Ready to break some wrists")
 
@@ -169,18 +186,113 @@ async def score(ctx, _author: discord.Member = None):
     _guild = ctx.guild
 
     async with bot.db.cursor() as cursor:
-        await cursor.execute(f"SELECT streak, xp, has_posted_today FROM {DB_NAME} WHERE user = ? AND guild = ?",
+        await cursor.execute(f"SELECT streak, xp, has_posted_today, max_streak FROM {DB_NAME} WHERE user = ? AND guild = ?",
                              (_author.id, _guild.id))
         user_data = await cursor.fetchone()
 
     if user_data:
-        streak, xp, has_posted = user_data[0], user_data[1], bool(user_data[2])
+        streak, xp, has_posted, max_streak = user_data[0], user_data[1], bool(user_data[2]), user_data[3]
     else:
-        streak, xp, has_posted = 0, 0, False
+        streak, xp, has_posted, max_streak = 0, 0, False, 0
 
     log.info(f"{_author} has {streak} day streak, xp: {xp}, has posted: {has_posted}, role: {_author.roles}")
-    em = discord.Embed(title=f"{_author.name}'s score", description=f"score: {xp}\nstreak: {streak}\nhas posted: {has_posted}")
-    await ctx.send(embed=em)
+    em = discord.Embed(title=f"{_author.name}'s Score", description=f"Score: {xp}  |  "
+                                                                    f"Streak: {streak}  |  "
+                                                                    f"Safe?: {has_posted}  |  "
+                                                                    f"Max streak: {max_streak}")
+
+    channel = next((ch for ch in bot.get_all_channels() if ch.name in CHANNEL_TO_POST), None)
+    if channel:
+        await ctx.send(embed=em)
+
+
+@bot.command()
+async def set_safe(ctx, *args):
+    _channel = ctx.channel
+    _author = ctx.author
+    _guild = ctx.guild
+
+    user_name = str(args[0])
+
+    log.info(f"{_author} setting safe status of {user_name} in server {_guild}.")
+
+    if user_has_admin_role(_author.roles, ADMIN_ROLES):
+        async with bot.db.cursor() as cursor:
+            await cursor.execute(f"SELECT user from {DB_NAME} where guild = ?", (_guild.id,))
+            data = await cursor.fetchall()
+
+        for i, user in enumerate(data):
+            name = await ctx.bot.fetch_user(user[0])
+            curr_name = name.name
+            if curr_name == user_name:
+                async with bot.db.cursor() as cursor:
+                    await cursor.execute(f"UPDATE {DB_NAME} SET has_posted = ? WHERE user = ? AND guild = ?",
+                                         (1, name.id, _guild.id))
+
+                channel = next((ch for ch in bot.get_all_channels() if ch.name in CHANNEL_TO_POST), None)
+                log.info(f"Set {1} has_posted to {user_name} in server {_guild}.")
+                await channel.send(f"Set has_posted = 1 to {user_name}")
+                await bot.db.commit()
+
+
+@bot.command()
+async def set_streak(ctx, *args):
+    _channel = ctx.channel
+    _author = ctx.author
+    _guild = ctx.guild
+
+    user_name = str(args[0])
+    new_streak = int(args[1])
+
+    log.info(f"{_author} setting streak of {user_name} in server {_guild} to {new_streak}.")
+
+    if user_has_admin_role(_author.roles, ADMIN_ROLES):
+        async with bot.db.cursor() as cursor:
+            await cursor.execute(f"SELECT user from {DB_NAME} where guild = ?", (_guild.id,))
+            data = await cursor.fetchall()
+
+        for i, user in enumerate(data):
+            name = await ctx.bot.fetch_user(user[0])
+            curr_name = name.name
+            if curr_name == user_name:
+                async with bot.db.cursor() as cursor:
+                    await cursor.execute(f"UPDATE {DB_NAME} SET streak = ? WHERE user = ? AND guild = ?",
+                                         (new_streak, name.id, _guild.id))
+                await bot.db.commit()
+
+                channel = next((ch for ch in bot.get_all_channels() if ch.name in CHANNEL_TO_POST), None)
+                log.info(f"Set {new_streak}-day streak to {user_name} in server {_guild}.")
+                await channel.send(f"Set {new_streak}-day streak to {user_name}")
+
+
+@bot.command()
+async def set_xp(ctx, *args):
+    _channel = ctx.channel
+    _author = ctx.author
+    _guild = ctx.guild
+
+    user_name = str(args[0])
+    new_xp = int(args[1])
+
+    log.info(f"{_author} setting streak of {user_name} in server {_guild} to {new_xp}.")
+
+    if user_has_admin_role(_author.roles, ADMIN_ROLES):
+        async with bot.db.cursor() as cursor:
+            await cursor.execute(f"SELECT user from {DB_NAME} where guild = ?", (_guild.id,))
+            data = await cursor.fetchall()
+
+        for i, user in enumerate(data):
+            name = await ctx.bot.fetch_user(user[0])
+            curr_name = name.name
+            if curr_name == user_name:
+                async with bot.db.cursor() as cursor:
+                    await cursor.execute(f"UPDATE {DB_NAME} SET xp = ? WHERE user = ? AND guild = ?",
+                                         (new_xp, name.id, _guild.id))
+                await bot.db.commit()
+
+                channel = next((ch for ch in bot.get_all_channels() if ch.name in CHANNEL_TO_POST), None)
+                log.info(f"Set {new_xp} xp to {user_name} in server {_guild}.")
+                await channel.send(f"Set {new_xp} xp to {user_name} .")
 
 
 @bot.command(pass_context=True)
@@ -198,30 +310,31 @@ async def scoreboard(ctx):
         name = await ctx.bot.fetch_user(user[0])
         log.info(f"{user, name}")
         em.add_field(name=f"{i+1}. {name}", value=f"max streak: {user[1]}, streak: {user[2]}, total xp: {user[3]}", inline=False)
-    await ctx.send(embed=em)
+
+    channel = next((ch for ch in bot.get_all_channels() if ch.name in CHANNEL_TO_POST), None)
+    if channel:
+        await ctx.send(embed=em)
 
 
 @bot.command()
-@commands.has_role("test")
 async def daily_reset(ctx, _author: discord.Member = None):
     _channel = ctx.channel
     if _author is None:
         _author = ctx.author
     _guild = ctx.guild
 
-    log.info(f"Forced daily reset by: {_author}")
+    log.info(f"Forced daily reset by: {_author} {_author.roles}")
+    if not user_has_admin_role(_author.roles, ADMIN_ROLES):
+        return
     await daily_task_standalone()
 
 
 async def daily_task_standalone():
     log.info("Resetting post status!")
 
-    channel_id = None
-    for ch in bot.get_all_channels():
-        if ch.name in CHANNELS_TO_LISTEN:
-            channel_id = ch.id
-    channel = bot.get_channel(channel_id)
-    await channel.send("Pruning the weaklings..")
+    channel = next((ch for ch in bot.get_all_channels() if ch.name in CHANNEL_TO_POST), None)
+    if channel:
+        await channel.send("Pruning the weaklings..")
 
     await bot.wait_until_ready()
     async with bot.db.cursor() as cursor:
