@@ -7,7 +7,7 @@ import colorama
 import discord
 from discord.ext import commands, tasks
 
-from config import BASE_XP, TIME_FORMAT, DB_NAME, FILE_TYPES, CHANNELS_TO_LISTEN, ADMIN_ROLES, CHANNEL_TO_POST
+from config import CHANNELS_TO_TRACK, BASE_XP, TIME_FORMAT, DB_NAME, FILE_TYPES, CHANNELS_TO_LISTEN, ADMIN_ROLES, CHANNEL_TO_POST
 from discord_token import DISCORD_TOKEN
 
 colorama.init()
@@ -67,14 +67,14 @@ async def handle_existing_user(msg: discord.Message, cursor, curr_xp):
     _guild = msg.guild
 
     new_xp = curr_xp + BASE_XP
-    log.info(f"Adding {BASE_XP} to {_author.id} in guild {_guild.id}")
+    log.info(f"Adding {BASE_XP} to {_author.id} in guild {_guild.id}. (Current exp: {new_xp})")
 
     await cursor.execute(f"UPDATE {DB_NAME} SET xp = ?, last_submission = ? WHERE user = ? AND guild = ?",
                          (new_xp, datetime.datetime.now().strftime(TIME_FORMAT), _author.id, _guild.id))
 
     channel = next((ch for ch in bot.get_all_channels() if ch.name in CHANNEL_TO_POST), None)
     if channel:
-        await _channel.send(f"Added {BASE_XP} to {_author} in server {_guild}. (Current exp: {new_xp})")
+        await _channel.send(f"Added {BASE_XP} point to {_author}.")
     await bot.db.commit()
 
 
@@ -140,7 +140,7 @@ async def on_message(message: discord.Message) -> None:
     if _author.bot:
         return
 
-    if message_contains_image(message):
+    if message_contains_image(message) and _channel.name in CHANNELS_TO_TRACK:
         log.info("Image was detected.")
 
         # find data by user and guild id
