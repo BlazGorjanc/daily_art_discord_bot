@@ -226,7 +226,7 @@ async def set_safe(ctx, *args):
             curr_name = name.name
             if curr_name == user_name:
                 async with bot.db.cursor() as cursor:
-                    await cursor.execute(f"UPDATE {DB_NAME} SET has_posted = ? WHERE user = ? AND guild = ?",
+                    await cursor.execute(f"UPDATE {DB_NAME} SET has_posted_today = ? WHERE user = ? AND guild = ?",
                                          (1, name.id, _guild.id))
 
                 channel = next((ch for ch in bot.get_all_channels() if ch.name in CHANNEL_TO_POST), None)
